@@ -1,0 +1,142 @@
+import pandas as pd
+import math
+from tqdm import tqdm
+import random
+from typing import Optional
+
+# Helper: Efficiently sample k distinct non-square integers in [low, high]
+def sample_non_squares(low: int, high: int, k: int, seed: Optional[int] = None):
+    """
+    Randomly sample k distinct non-square integers in [low, high].
+    Avoids constructing the full pool (memory efficient).
+    """
+    if seed is not None:
+        random.seed(seed)
+    chosen = set()
+    while len(chosen) < k:
+        n = random.randint(low, high)
+        r = math.isqrt(n)
+        if r * r == n:  # skip perfect squares
+            continue
+        chosen.add(n)
+    return sorted(chosen)
+
+# Stratified sampling on log10(N): fixed number per bin
+def stratified_sample_non_squares(low: int, high: int, num_bins: int = 6, per_bin: int = 20, seed: Optional[int] = None):
+    """
+    Stratified sampling of non-square integers in [low, high] using equal-width bins on log10(N).
+    Returns a sorted list with approximately num_bins * per_bin samples (some bins may underfill
+    if the integer range is too tight).
+    """
+    if seed is not None:
+        random.seed(seed)
+    # Build log10 edges
+    lo_log = math.log10(max(2, low))
+    hi_log = math.log10(high)
+    edges_log = [lo_log + i * (hi_log - lo_log) / num_bins for i in range(num_bins + 1)]
+
+    chosen = []
+    for i in range(num_bins):
+        # Convert log edges back to integer bounds for this bin
+        L = int(max(low, math.ceil(10 ** edges_log[i])))
+        R = int(min(high, math.floor(10 ** edges_log[i + 1] - 1)))
+        if L > R:
+            # Empty bin in integer space; skip
+            continue
+        S = set()
+        attempts = 0
+        max_attempts = per_bin * 200
+        while len(S) < per_bin and attempts < max_attempts:
+            n = random.randint(L, R)
+            r = math.isqrt(n)
+            if r * r != n:  # keep only non-squares
+                S.add(n)
+            attempts += 1
+        chosen.extend(sorted(S))
+    return sorted(chosen)
+
+def chakravala_method(N):
+    # Check if N is a perfect square
+    sqrt_N = int(math.isqrt(N))
+    if sqrt_N * sqrt_N == N:
+        raise ValueError("N cannot be a perfect square.")
+
+    # Choose initial (a, b, k) with k as close to 0 as possible and |k| minimal
+    # Use ⌈√N⌉ instead of ⌊√N⌋ to start with the smallest positive k
+    a = sqrt_N + 1
+    b = 1
+    k = a * a - N * b * b
+
+
+    # Loop until k == 1
+    while k != 1:
+        # Step 3.1: Choose m such that (a + b*m) divisible by k and |m^2 - N| minimal
+        m_candidates = []
+        limit = int(math.isqrt(N)) + 1
+        # ❶ search only non‑negative m
+        # ❷ skip the degenerate case a + b m = 0 to avoid b = 0
+        for m in range(0, limit + 1):
+            if (a + b * m) % k == 0 and (a + b * m) != 0:
+                m_candidates.append(m)
+
+        # If no candidate found in the initial window, enlarge the search range
+        while not m_candidates:
+            limit *= 2
+            for m in range(0, limit + 1):
+                if (a + b * m) % k == 0 and (a + b * m) != 0:
+                    m_candidates.append(m)
+
+        # Pick the m that minimises |m² − N|
+        m = min(m_candidates, key=lambda m: abs(m * m - N))
+
+        # Compute new (a, b, k) using Brahmagupta-Fibonacci identity (Chakravala standard)
+        # Add integer validation before assignment
+        if (a * m + N * b) % abs(k) != 0 or (a + b * m) % abs(k) != 0:
+            raise ValueError("Non-integer solution encountered during iteration.")
+        a_new = (a * m + N * b) // abs(k)
+        b_new = (a + b * m) // abs(k)
+        k_new = (m * m - N) // k
+
+        a, b, k = a_new, b_new, k_new
+
+    # Check the solution
+    if a * a - N * b * b != 1:
+        raise ValueError(f"Final result does not satisfy Pell equation: {a}^2 - {N}*{b}^2 != 1")
+    return a, b
+
+#x^2 - 61y^2 = 1
+if __name__ == "__main__":
+    # Stratified sampling: 6 equal-width bins on log10(N), fixed quota per bin
+    num_bins = 6
+    per_bin = 30  # total target = num_bins * per_bin = 180
+    sampled_N = stratified_sample_non_squares(2, 10_000_000, num_bins=num_bins, per_bin=per_bin, seed=20250818)
+
+    #log bin coverage report (for transparency)
+    try:
+        s = pd.Series(sampled_N, name="N")
+        s_log = s.apply(lambda v: math.log10(v))
+        edges_log = [s_log.min() + i * (s_log.max() - s_log.min()) / num_bins for i in range(num_bins + 1)]
+        cats = pd.cut(s_log, bins=edges_log, include_lowest=True)
+        counts = cats.value_counts().sort_index()
+        print("[Stratified sampling] Bin counts (log10 N bins):")
+        for iv, c in counts.items():
+            print(f"  {iv}: n = {int(c)}")
+    except Exception as e:
+        print(f"[Stratified sampling] Bin coverage report skipped: {e}")
+
+    results = []
+    for N in tqdm(sampled_N, total=len(sampled_N), desc="Processing stratified N"):
+        try:
+            x, y = chakravala_method(N)
+            results.append({"N": N, "x": x, "y": y})
+        except ValueError as err:  # Extremely rare failures
+            print(f"Error for N={N}: {err}")
+
+    # Write results to Excel (cast big ints to text to avoid OverflowError/precision loss)
+    df = pd.DataFrame(results, columns=["N", "x", "y"])
+    df["x"] = df["x"].astype(str)
+    df["y"] = df["y"].astype(str)
+    output_file = "chakravala_solutions_random100_2_to_1e7.xlsx"
+    # Use the faster XlsxWriter engine
+    df.to_excel(output_file, index=False, engine="xlsxwriter")
+    print(f"Saved {len(df)} solutions to {output_file}")
